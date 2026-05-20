@@ -28,6 +28,7 @@ import {
 import { isByosEnabled, secretManager } from "@/secrets-manager";
 import {
   autoReinstallServer,
+  onlyForwardCompatibleEnvDiff,
   requiresNewUserInputForReinstall,
 } from "@/services/mcp-reinstall";
 import {
@@ -224,12 +225,14 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
         // Direct client_secret value
         const clientSecret = restBody.oauthConfig.client_secret;
         if (clientSecret) {
-          clientSecretId = await upsertCatalogClientSecretValue({
+          // `rotated` is irrelevant here: no installs exist yet on create.
+          const result = await upsertCatalogClientSecretValue({
             clientSecretId,
             catalogName: restBody.name,
             key: "client_secret",
             value: clientSecret,
           });
+          clientSecretId = result.id;
 
           restBody.clientSecretId = clientSecretId;
         }
@@ -239,12 +242,13 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const enterpriseManagedClientSecretOverride =
         restBody.enterpriseManagedConfig?.clientSecretOverride;
       if (enterpriseManagedClientSecretOverride) {
-        clientSecretId = await upsertCatalogClientSecretValue({
+        const result = await upsertCatalogClientSecretValue({
           clientSecretId,
           catalogName: restBody.name,
           key: ENTERPRISE_MANAGED_CLIENT_SECRET_OVERRIDE_SECRET_KEY,
           value: enterpriseManagedClientSecretOverride,
         });
+        clientSecretId = result.id;
 
         restBody.clientSecretId = clientSecretId;
         delete restBody.enterpriseManagedConfig?.clientSecretOverride;
@@ -522,6 +526,29 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Catalog item not found");
       }
 
+      // A second copy of the same row WITHOUT expanded secret values, used
+      // solely for the cascade-reinstall gate's snapshot comparison. The
+      // expanded `originalCatalogItem` above is needed by the route body
+      // downstream (env-vault construction, userConfig diffing). But the
+      // gate compares `original` vs `Model.update`'s return, and
+      // `Model.update` returns the raw row. Without this unexpanded
+      // fetch, every PUT on a bag-bearing catalog would diff on
+      // `localConfig.environment[*].value` (expanded plaintext vs stored
+      // ID-ref) and cascade-reinstall on edits that didn't actually
+      // touch any runtime field — including pure description edits.
+      const originalCatalogItemForGate = await InternalMcpCatalogModel.findById(
+        id,
+        {
+          userId: request.user.id,
+          isAdmin,
+          organizationId: request.organizationId,
+          expandSecrets: false,
+        },
+      );
+      if (!originalCatalogItemForGate) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
       if (!isAdmin) {
         // Non-admins can only edit their own personal items
         if (
@@ -548,6 +575,18 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       let clientSecretId = originalCatalogItem.clientSecretId;
       let localConfigSecretId = originalCatalogItem.localConfigSecretId;
+
+      // Catalog secret-bag value rotations are invisible to the
+      // unexpanded gate snapshot (the bag content lives outside the
+      // catalog row). Track here as we write to an EXISTING bag so the
+      // cascade can force the auto-restart path on rotation. Covers
+      // direct OAuth client_secret, enterprise-managed client-secret
+      // override, non-prompted secret env-var values, and image-pull-
+      // secret credential passwords. The Readonly-Vault flows always
+      // delete+create the bag — that swaps the `clientSecretId` /
+      // `localConfigSecretId` on the row itself, so the normal gate
+      // already detects them; no override needed there.
+      let catalogSharedSecretValuesRotated = false;
 
       // Handle OAuth client secret - either via Readonly Vault or direct value
       if (oauthClientSecretVaultPath && oauthClientSecretVaultKey) {
@@ -592,12 +631,14 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
         // Direct client_secret value
         const clientSecret = restBody.oauthConfig.client_secret;
         if (clientSecret) {
-          clientSecretId = await upsertCatalogClientSecretValue({
+          const result = await upsertCatalogClientSecretValue({
             clientSecretId,
             catalogName: originalCatalogItem.name,
             key: "client_secret",
             value: clientSecret,
           });
+          clientSecretId = result.id;
+          if (result.rotated) catalogSharedSecretValuesRotated = true;
 
           restBody.clientSecretId = clientSecretId;
         }
@@ -607,12 +648,14 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const enterpriseManagedClientSecretOverride =
         restBody.enterpriseManagedConfig?.clientSecretOverride;
       if (enterpriseManagedClientSecretOverride) {
-        clientSecretId = await upsertCatalogClientSecretValue({
+        const result = await upsertCatalogClientSecretValue({
           clientSecretId,
           catalogName: originalCatalogItem.name,
           key: ENTERPRISE_MANAGED_CLIENT_SECRET_OVERRIDE_SECRET_KEY,
           value: enterpriseManagedClientSecretOverride,
         });
+        clientSecretId = result.id;
+        if (result.rotated) catalogSharedSecretValuesRotated = true;
 
         restBody.clientSecretId = clientSecretId;
         delete restBody.enterpriseManagedConfig?.clientSecretOverride;
@@ -681,6 +724,9 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
           if (envVar.type === "secret" && !envVar.promptOnInstallation) {
             if (envVar.value) {
               // New value provided - use it
+              if (existingSecretValues[envVar.key] !== envVar.value) {
+                catalogSharedSecretValuesRotated = true;
+              }
               secretEnvVars[envVar.key] = envVar.value;
               delete envVar.value; // Remove value from catalog template
             } else if (existingSecretValues[envVar.key]) {
@@ -700,12 +746,41 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
               const regcredKey = `__regcred_password:${entry.server}:${entry.username}`;
               if (entry.password) {
                 // New password provided - use it
+                if (existingSecretValues[regcredKey] !== entry.password) {
+                  catalogSharedSecretValuesRotated = true;
+                }
                 secretEnvVars[regcredKey] = entry.password;
                 delete entry.password; // Strip from catalog template
               } else if (existingSecretValues[regcredKey]) {
                 // No new password but key exists in existing secret - preserve it
                 secretEnvVars[regcredKey] = existingSecretValues[regcredKey];
               }
+            }
+          }
+        }
+        // A key that lived in the existing bag but is no longer
+        // referenced by either env vars or image-pull-secrets gets
+        // implicitly dropped on `updateSecret` below — that's a value
+        // change on the bag, so flag it as rotation.
+        //
+        // Gated on whether the request actually supplied either
+        // local-config surface that produces bag keys. A userConfig-
+        // only edit enters this `else if` branch (because the outer
+        // condition matches `restBody.userConfig`) without supplying
+        // a `localConfig`, leaving `secretEnvVars` empty solely
+        // because there were no env-var/imagePullSecret entries to
+        // iterate — not because keys were dropped. Without this
+        // gate, a userConfig-only edit (e.g. adding an optional
+        // header) would falsely force the auto path on a catalog
+        // with any pre-existing local secret bag.
+        const localBagSurfaceTouched =
+          restBody.localConfig?.environment !== undefined ||
+          restBody.localConfig?.imagePullSecrets !== undefined;
+        if (localBagSurfaceTouched) {
+          for (const existingKey of Object.keys(existingSecretValues)) {
+            if (!(existingKey in secretEnvVars)) {
+              catalogSharedSecretValuesRotated = true;
+              break;
             }
           }
         }
@@ -777,20 +852,39 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // (plaintext jsonb instead of the bag, or stale bag still merged
       // over jsonb by the read path).
       //
-      // The partition runs against the *effective* userConfig — the
-      // incoming one when this PUT updates userConfig, otherwise the
-      // row's current userConfig. Reading only originalCatalogItem
-      // would misroute values for fields newly flipped to sensitive in
-      // the same request.
+      // The partition runs against the *effective* parent — the incoming
+      // userConfig / localConfig when the request supplies them,
+      // otherwise the row's current values. Reading only
+      // originalCatalogItem would misroute values for fields newly
+      // flipped to sensitive (userConfig) or newly flipped to
+      // `type: "secret"` on a prompted-on-preset env var.
       const parentForPartition: InternalMcpCatalog = {
         ...originalCatalogItem,
         userConfig: restBody.userConfig ?? originalCatalogItem.userConfig,
+        localConfig: restBody.localConfig
+          ? {
+              ...(originalCatalogItem.localConfig ?? {}),
+              ...restBody.localConfig,
+            }
+          : originalCatalogItem.localConfig,
       };
+      // True when the set of preset-scoped *secret* keys differs between
+      // the old and new effective parent — covers both surfaces:
+      //   • userConfig: a field flipped `sensitive` true/false (or a
+      //     promptOnPreset sensitive field was added/removed)
+      //   • localConfig.environment: a `promptOnPreset` env var's
+      //     `type` flipped between "secret" and anything else (or
+      //     such an env var was added/removed)
+      // Either kind of flip means children's already-stored preset
+      // values need to be repartitioned between plaintext jsonb and
+      // the secret bag, otherwise the read path returns stale data
+      // from the wrong storage.
       const secretKeysChanged =
-        restBody.userConfig !== undefined &&
-        presetSecretKeysChanged(
-          originalCatalogItem.userConfig,
-          restBody.userConfig,
+        (restBody.userConfig !== undefined ||
+          restBody.localConfig !== undefined) &&
+        !setsEqual(
+          collectSecretPresetKeys(originalCatalogItem),
+          collectSecretPresetKeys(parentForPartition),
         );
       // Enforce the org-wide default validation regex against incoming
       // default-scoped values. Symmetric to the entry-regex check on the
@@ -814,6 +908,7 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
       }
 
+      let parentPresetBagRotated = false;
       if (restBody.presetFieldValues !== undefined || secretKeysChanged) {
         const repartitioned = await repartitionStoredPresetValues({
           row: {
@@ -831,6 +926,7 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
           (restBody as Record<string, unknown>).presetSecretId =
             repartitioned.presetSecretId;
         }
+        if (repartitioned.bagValuesRotated) parentPresetBagRotated = true;
       }
 
       // Update the catalog item
@@ -840,8 +936,22 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Catalog item not found");
       }
 
-      // Cascade reinstall for the parent's own installs.
-      await cascadeReinstallForCatalog(originalCatalogItem, catalogItem);
+      // Cascade reinstall for the parent's own installs. Use the
+      // unexpanded snapshot so the gate's diff isn't fooled by
+      // expanded-vs-raw asymmetry on bag-bearing rows (see comment
+      // above on `originalCatalogItemForGate`). Force the auto-restart
+      // path when secret bag values rotated — those changes are
+      // invisible to the row-diff gate, so without the override pods
+      // would keep injecting the stale value until something else
+      // triggered a restart.
+      await cascadeReinstallForCatalog(
+        originalCatalogItemForGate,
+        catalogItem,
+        {
+          forceAutoRestart:
+            catalogSharedSecretValuesRotated || parentPresetBagRotated,
+        },
+      );
 
       // Cascade syncable fields to children, then trigger reinstall for each
       // child's installs. Note: this snapshots children BEFORE updating them
@@ -859,6 +969,7 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
       const syncableValues = pickSyncableFields(catalogItem);
       for (const originalChild of children) {
         const childUpdates: Record<string, unknown> = { ...syncableValues };
+        let childBagRotated = false;
         if (secretKeysChanged) {
           const repartitioned = await repartitionStoredPresetValues({
             row: {
@@ -872,13 +983,19 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
           if (repartitioned.presetSecretId !== originalChild.presetSecretId) {
             childUpdates.presetSecretId = repartitioned.presetSecretId;
           }
+          if (repartitioned.bagValuesRotated) childBagRotated = true;
         }
         const updatedChild = await InternalMcpCatalogModel.update(
           originalChild.id,
           childUpdates as typeof syncableValues,
         );
         if (!updatedChild) continue;
-        await cascadeReinstallForCatalog(originalChild, updatedChild);
+        // Children inherit `clientSecretId` and `localConfigSecretId`
+        // from the parent (see `SyncableCatalogFields`), so any rotation
+        // to the parent's shared bag also affects every child install.
+        await cascadeReinstallForCatalog(originalChild, updatedChild, {
+          forceAutoRestart: catalogSharedSecretValuesRotated || childBagRotated,
+        });
       }
 
       // Note: Tools are NOT deleted - they are synced during reinstall to preserve
@@ -1131,7 +1248,19 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       // Clear the custom deployment YAML
-      await InternalMcpCatalogModel.update(id, { deploymentSpecYaml: null });
+      const updated = await InternalMcpCatalogModel.update(id, {
+        deploymentSpecYaml: null,
+      });
+
+      // Cascade-reinstall installed pods so they pick up the
+      // auto-generated manifest. Without this, existing pods would keep
+      // running on the (now-cleared) override until another unrelated
+      // edit or manual reinstall triggered a restart. The standard
+      // gate handles the decision: pods come up with the new template
+      // via the auto path (no user re-prompt needed).
+      if (updated) {
+        await cascadeReinstallForCatalog(catalogItem, updated);
+      }
 
       // Extract imagePullSecrets names for YAML preview
       const imagePullSecretsForYaml = catalogItem.localConfig?.imagePullSecrets
@@ -1365,12 +1494,24 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       await assertCanEditCatalogPresets(parent, request);
 
-      const originalChild = await InternalMcpCatalogModel.findById(childId);
+      // Unexpanded snapshot — same reason as `originalCatalogItemForGate`
+      // in the parent PUT route: comparing an `expandSecrets: true`
+      // snapshot against `Model.update`'s raw return would diff on
+      // expanded secret values and cascade-reinstall on edits that
+      // didn't touch any runtime field.
+      const originalChild = await InternalMcpCatalogModel.findById(childId, {
+        expandSecrets: false,
+      });
       if (!originalChild || originalChild.parentCatalogItemId !== parent.id) {
         throw new ApiError(404, "Child catalog item not found");
       }
 
       const updates: Record<string, unknown> = {};
+      // Preset secret bag value rotations are invisible to the
+      // unexpanded gate snapshot (same `presetSecretId`, different
+      // content). Track here so the cascade can force the auto-restart
+      // path.
+      let presetBagRotated = false;
       if (presetFieldValues !== undefined) {
         // Lenient filter (not the strict validator used on create / install):
         // when a parent edit flips a field's scope from `promptOnPreset:
@@ -1410,7 +1551,7 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
           }
         }
 
-        const { nonSecretFieldValues, presetSecretId } =
+        const { nonSecretFieldValues, presetSecretId, bagValuesRotated } =
           await partitionPresetFieldValuesAndUpsertSecrets({
             parent,
             catalogRow: {
@@ -1423,6 +1564,7 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
         if (presetSecretId !== originalChild.presetSecretId) {
           updates.presetSecretId = presetSecretId;
         }
+        if (bagValuesRotated) presetBagRotated = true;
       }
 
       const updatedChild = await InternalMcpCatalogModel.update(
@@ -1434,7 +1576,14 @@ const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       // Reinstall installs that point at this child if preset values changed.
-      await cascadeReinstallForCatalog(originalChild, updatedChild);
+      // Force the auto-restart path when the preset secret bag's content
+      // rotated — that write happens against the same `presetSecretId`,
+      // so the gate's row-diff can't see it and would otherwise skip
+      // the cascade. Pods would keep injecting the old secret value
+      // until something else triggered a restart.
+      await cascadeReinstallForCatalog(originalChild, updatedChild, {
+        forceAutoRestart: presetBagRotated,
+      });
 
       return reply.send(updatedChild);
     },
@@ -1489,10 +1638,18 @@ async function upsertCatalogClientSecretValue(params: {
   catalogName: string;
   key: string;
   value: string;
-}): Promise<string> {
+}): Promise<{ id: string; rotated: boolean }> {
   const existingSecretValues = await getCatalogClientSecretValues(
     params.clientSecretId,
   );
+  // `rotated` distinguishes "value actually changed on an existing bag"
+  // from "writing the same value back". The cascade gate uses this to
+  // decide whether to force a pod restart (the bag content lives
+  // outside the catalog row, so a same-id-different-content write is
+  // invisible to the row-diff gate). For new bags the caller's row
+  // diff covers the cascade via the new `clientSecretId`, so `rotated`
+  // is irrelevant there.
+  const rotated = existingSecretValues[params.key] !== params.value;
   const secretValue = {
     ...existingSecretValues,
     [params.key]: params.value,
@@ -1500,14 +1657,14 @@ async function upsertCatalogClientSecretValue(params: {
 
   if (params.clientSecretId) {
     await secretManager().updateSecret(params.clientSecretId, secretValue);
-    return params.clientSecretId;
+    return { id: params.clientSecretId, rotated };
   }
 
   const secret = await secretManager().createSecret(
     secretValue,
     `${params.catalogName}-client-secrets`,
   );
-  return secret.id;
+  return { id: secret.id, rotated };
 }
 
 async function getCatalogClientSecretValues(
@@ -1538,19 +1695,10 @@ async function getCatalogClientSecretValues(
  * plaintext keys now want the secret bag, and previously-secret keys now
  * want plaintext jsonb.
  */
-function presetSecretKeysChanged(
-  oldUserConfig: InternalMcpCatalog["userConfig"],
-  newUserConfig: InternalMcpCatalog["userConfig"],
-): boolean {
-  const old = collectSecretPresetKeys({
-    userConfig: oldUserConfig,
-  } as InternalMcpCatalog);
-  const next = collectSecretPresetKeys({
-    userConfig: newUserConfig,
-  } as InternalMcpCatalog);
-  if (old.size !== next.size) return true;
-  for (const k of old) if (!next.has(k)) return true;
-  return false;
+function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
 }
 
 /**
@@ -1578,6 +1726,7 @@ async function repartitionStoredPresetValues(params: {
 }): Promise<{
   presetFieldValues: PresetFieldValues;
   presetSecretId: string | null;
+  bagValuesRotated: boolean;
 }> {
   const rawEffective: PresetFieldValues = {
     ...(params.row.presetFieldValues ?? {}),
@@ -1605,7 +1754,7 @@ async function repartitionStoredPresetValues(params: {
     params.parent,
     rawEffective,
   );
-  const { nonSecretFieldValues, presetSecretId } =
+  const { nonSecretFieldValues, presetSecretId, bagValuesRotated } =
     await partitionPresetFieldValuesAndUpsertSecrets({
       parent: params.parent,
       catalogRow: {
@@ -1614,7 +1763,11 @@ async function repartitionStoredPresetValues(params: {
       },
       incoming: effective,
     });
-  return { presetFieldValues: nonSecretFieldValues, presetSecretId };
+  return {
+    presetFieldValues: nonSecretFieldValues,
+    presetSecretId,
+    bagValuesRotated,
+  };
 }
 
 /**
@@ -1651,6 +1804,17 @@ async function partitionPresetFieldValuesAndUpsertSecrets(params: {
 }): Promise<{
   nonSecretFieldValues: PresetFieldValues;
   presetSecretId: string | null;
+  /**
+   * True when (and only when) this call WROTE a different value set to
+   * an EXISTING preset secret bag (same `presetSecretId`, changed
+   * content). Used
+   * by the cascade gate to force the auto-restart path — a same-id-
+   * different-content update is invisible to the row-diff gate. New
+   * bags (`presetSecretId` flips from null to a new id) and bag
+   * deletions both move the row's pointer, so the gate detects them
+   * naturally without this signal.
+   */
+  bagValuesRotated: boolean;
 }> {
   const { parent, catalogRow, incoming } = params;
   const secretKeys = collectSecretPresetKeys(parent);
@@ -1690,8 +1854,15 @@ async function partitionPresetFieldValuesAndUpsertSecrets(params: {
   const mergedHasKeys = Object.keys(mergedBag).length > 0;
 
   let presetSecretId = catalogRow.presetSecretId;
+  let bagValuesRotated = false;
   if (mergedHasKeys) {
     if (presetSecretId) {
+      // Same-id update — detect if content actually changed before
+      // signalling rotation. Compares against the *uncleaned*
+      // existing bag so the "declassified key was dropped" case
+      // (mergedBag missing a key the old bag had) also counts as
+      // rotation.
+      bagValuesRotated = !shallowEqualStringMap(existingBag, mergedBag);
       await secretManager().updateSecret(presetSecretId, mergedBag);
     } else {
       const secret = await secretManager().createSecret(
@@ -1712,35 +1883,52 @@ async function partitionPresetFieldValuesAndUpsertSecrets(params: {
     presetSecretId = null;
   }
 
-  return { nonSecretFieldValues, presetSecretId };
+  return { nonSecretFieldValues, presetSecretId, bagValuesRotated };
+}
+
+function shallowEqualStringMap(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): boolean {
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (String(a[k] ?? "") !== String(b[k] ?? "")) return false;
+  }
+  return true;
 }
 
 async function cascadeReinstallForCatalog(
   originalCatalogItem: InternalMcpCatalog,
   catalogItem: InternalMcpCatalog,
+  /**
+   * Force the auto-restart path past the "no restart needed" gates
+   * (metadata-only, forward-compat) — used when the caller has
+   * out-of-band knowledge that pods need to restart even though the
+   * row looks unchanged (primarily catalog secret-bag value rotation:
+   * non-prompted secret env vars, OAuth client_secret, image-pull-
+   * secret passwords, default-preset sensitive values). The bag
+   * content lives outside the catalog row, so the unexpanded gate
+   * snapshot cannot see a value change.
+   *
+   * Does NOT override `requiresNewUserInputForReinstall`. If the same
+   * PUT both rotates a secret AND adds a re-prompt-requiring change
+   * (e.g. a new required prompted env var), the cascade must still
+   * mark servers for manual reinstall — auto-restarting would bring
+   * pods back without the newly-required input. The two signals are
+   * orthogonal: rotation says "pods need to restart for the value to
+   * propagate"; re-prompt says "no restart can succeed until the user
+   * supplies a value the install doesn't have."
+   */
+  override?: { forceAutoRestart?: boolean },
 ): Promise<void> {
   const installedServers = await McpServerModel.findByCatalogId(catalogItem.id);
   if (installedServers.length === 0) return;
 
-  // Skip the cascade when only metadata fields changed. List in
-  // `shared/catalog-runtime-fields.ts`.
-  //
-  // Tradeoff: `originalCatalogItem` is fetched with `expandSecrets: true`
-  // (the route body needs expanded secrets downstream); `Model.update`
-  // returns the unexpanded row. For catalogs carrying any secret bag
-  // pointer, the expanded vs unexpanded shapes differ even with no real
-  // edit, so the predicate returns false and we cascade. That is the
-  // safe direction (pre-fix baseline) and `hasSecretBag` in
-  // `edit-catalog-dialog.tsx` mirrors it on the UI side. The
-  // optimization applies cleanly to non-bag catalogs.
-  if (isMetadataOnlyEdit(originalCatalogItem, catalogItem)) {
-    logger.info(
-      { catalogId: catalogItem.id, serverCount: installedServers.length },
-      "Catalog edit is metadata-only - skipping reinstall",
-    );
-    return;
-  }
-
+  // Manual path is authoritative: a re-prompt edit blocks both the
+  // gate-decided auto path AND the forced auto path. Run it before any
+  // override branching.
   if (requiresNewUserInputForReinstall(originalCatalogItem, catalogItem)) {
     logger.info(
       { catalogId: catalogItem.id, serverCount: installedServers.length },
@@ -1752,10 +1940,52 @@ async function cascadeReinstallForCatalog(
     return;
   }
 
-  logger.info(
-    { catalogId: catalogItem.id, serverCount: installedServers.length },
-    "Catalog edit does not require new user input - auto-reinstalling servers",
-  );
+  if (override?.forceAutoRestart) {
+    logger.info(
+      { catalogId: catalogItem.id, serverCount: installedServers.length },
+      "Forced auto-restart cascade (caller signaled secret-bag value rotation)",
+    );
+  } else {
+    // Skip the cascade when only metadata fields changed. List in
+    // `shared/catalog-runtime-fields.ts`.
+    //
+    // Tradeoff: `originalCatalogItem` is fetched with `expandSecrets: true`
+    // (the route body needs expanded secrets downstream); `Model.update`
+    // returns the unexpanded row. For catalogs carrying any secret bag
+    // pointer, the expanded vs unexpanded shapes differ even with no real
+    // edit, so the predicate returns false and we cascade. That is the
+    // safe direction (pre-fix baseline) and `hasSecretBag` in
+    // `edit-catalog-dialog.tsx` mirrors it on the UI side. The
+    // optimization applies cleanly to non-bag catalogs.
+    if (isMetadataOnlyEdit(originalCatalogItem, catalogItem)) {
+      logger.info(
+        { catalogId: catalogItem.id, serverCount: installedServers.length },
+        "Catalog edit is metadata-only - skipping reinstall",
+      );
+      return;
+    }
+
+    // Refinement gate: `isMetadataOnlyEdit` is too blunt for env-var
+    // schema evolution. Adding an optional prompted env var, demoting
+    // required → optional, etc. legitimately changes `localConfig.environment`
+    // but doesn't invalidate any install (the existing pod's env-var
+    // bindings are still valid). Without this check, a forward-compatible
+    // edit would fall through to the auto-cascade path and silently restart
+    // every pod. Mirrors the frontend's `envChangeRequiresReinstall` so
+    // bar silence and backend behavior agree.
+    if (onlyForwardCompatibleEnvDiff(originalCatalogItem, catalogItem)) {
+      logger.info(
+        { catalogId: catalogItem.id, serverCount: installedServers.length },
+        "Catalog edit is a forward-compatible env-var change - skipping reinstall",
+      );
+      return;
+    }
+
+    logger.info(
+      { catalogId: catalogItem.id, serverCount: installedServers.length },
+      "Catalog edit does not require new user input - auto-reinstalling servers",
+    );
+  }
 
   setImmediate(async () => {
     try {
