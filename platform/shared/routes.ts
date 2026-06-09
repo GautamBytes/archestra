@@ -283,6 +283,7 @@ export const RouteId = {
   CreateChatConversation: "createChatConversation",
   ForkChatConversation: "forkChatConversation",
   UpdateChatConversation: "updateChatConversation",
+  SetConversationHooksDebug: "setConversationHooksDebug",
   DeleteChatConversation: "deleteChatConversation",
   CompactChatConversation: "compactChatConversation",
   GenerateChatConversationTitle: "generateChatConversationTitle",
@@ -532,6 +533,12 @@ export const RouteId = {
 
   // Audit Log Routes
   GetAuditLogs: "getAuditLogs",
+
+  // Hook File Routes
+  GetHooks: "getHooks",
+  CreateHook: "createHook",
+  UpdateHook: "updateHook",
+  DeleteHook: "deleteHook",
 
   // Skill Share Link Routes
   GetSkillShareLinks: "getSkillShareLinks",
