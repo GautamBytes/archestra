@@ -959,6 +959,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                       {
                         conversationId,
                         finishReason: probe.finishReason,
+                        rawFinishReason: probe.rawFinishReason,
                         attempt: emptyResponseAttempts,
                       },
                       "[EmptyResponse] model produced no content, retrying",
@@ -987,6 +988,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   }
                   throw new EmptyModelResponseError({
                     finishReason: probe.finishReason,
+                    rawFinishReason: probe.rawFinishReason,
                     attempts: emptyResponseAttempts,
                   });
                 }
