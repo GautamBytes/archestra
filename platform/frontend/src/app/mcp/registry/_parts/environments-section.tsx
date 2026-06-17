@@ -400,17 +400,34 @@ function EnvironmentEditorDialog({
       : null;
   const canSave = trimmedName.length > 0 && validationRegexError === null;
   const supportsFqdn = capabilities?.networkPolicy.supportsFqdn === true;
-  const networkPolicy = {
-    egressMode,
-    domainPreset:
-      egressMode === "restricted" && supportsFqdn ? domainPreset : "none",
-    allowedDomains:
-      egressMode === "restricted" && supportsFqdn
-        ? splitPolicyList(allowedDomainsText)
-        : [],
-    allowedCidrs:
-      egressMode === "restricted" ? splitPolicyList(allowedCidrsText) : [],
-  };
+  const enforcementUnavailable =
+    capabilities?.networkPolicy.provider === "none";
+  // With no enforcer the egress controls are disabled, so the form can't express
+  // intent. Persisting the default "restricted" + empty allowlists would silently
+  // become a deny-all once an enforcer is installed. Keep an existing policy
+  // untouched; for a new/policy-less environment save a non-enforcing one.
+  const originalNetworkPolicy =
+    mode === "default"
+      ? (defaultEnvironment?.networkPolicy ?? null)
+      : (environment?.networkPolicy ?? null);
+  const networkPolicy: NetworkPolicy = enforcementUnavailable
+    ? (originalNetworkPolicy ?? {
+        egressMode: "unrestricted",
+        domainPreset: "none",
+        allowedDomains: [],
+        allowedCidrs: [],
+      })
+    : {
+        egressMode,
+        domainPreset:
+          egressMode === "restricted" && supportsFqdn ? domainPreset : "none",
+        allowedDomains:
+          egressMode === "restricted" && supportsFqdn
+            ? splitPolicyList(allowedDomainsText)
+            : [],
+        allowedCidrs:
+          egressMode === "restricted" ? splitPolicyList(allowedCidrsText) : [],
+      };
 
   // The current value is included so editing an environment whose namespace
   // predates the configured list never silently drops it.
@@ -679,16 +696,24 @@ function NetworkPolicyFields({
   provider: string | null;
   disabled: boolean;
 }) {
+  // No enforcer on the cluster: every rule below would be accepted but never
+  // enforced, so the whole egress section is disabled rather than offering
+  // controls that silently do nothing.
+  const enforcementUnavailable = provider === "none";
   return (
     <div className="space-y-4">
-      {provider === "none" ? (
+      {enforcementUnavailable ? (
         <Alert variant="info">
           <Info className="h-4 w-4" />
           <AlertTitle>Network policy enforcement unavailable</AlertTitle>
           <AlertDescription className="block leading-6">
-            Kubernetes access is not configured, or network policy capabilities
-            could not be inspected. Enable a Kubernetes network policy provider
-            before relying on these policies.
+            No Kubernetes NetworkPolicy enforcer (Calico, Cilium, or a supported
+            FQDN provider) was detected, or Kubernetes access isn't configured,
+            so egress can't be enforced on this cluster. These controls are
+            disabled until a supported network policy provider is available.{" "}
+            <ExternalDocsLink href={NETWORK_POLICY_DOCS_URL}>
+              View docs
+            </ExternalDocsLink>
           </AlertDescription>
         </Alert>
       ) : !supportsFqdn ? (
@@ -717,7 +742,7 @@ function NetworkPolicyFields({
         <Select
           value={egressMode}
           onValueChange={(value) => setEgressMode(value as EgressMode)}
-          disabled={disabled}
+          disabled={disabled || enforcementUnavailable}
         >
           <SelectTrigger className="w-full">
             <SelectValue />
@@ -774,7 +799,9 @@ function NetworkPolicyFields({
           onChange={(e) => setAllowedCidrsText(e.target.value)}
           placeholder={"203.0.113.0/24\n2001:db8::/32"}
           className="min-h-20 font-mono text-sm"
-          disabled={disabled || egressMode !== "restricted"}
+          disabled={
+            disabled || enforcementUnavailable || egressMode !== "restricted"
+          }
         />
       </div>
 
