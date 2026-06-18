@@ -169,7 +169,7 @@ Auth credentials are stored in the secrets backend, which uses the database by d
 
 ### Credential Resolution
 
-Credential resolution decides which installed MCP server credential should be used for a tool call. A tool assignment can either pin a specific installed connection or ask Archestra to resolve a credential at execution time from the caller identity and available personal or team-scoped credentials.
+Credential resolution decides which installed MCP server credential should be used for a tool call. A tool assignment can either pin a specific installed connection or ask Archestra to resolve a credential at execution time from the caller identity, following the server's **Agent connections** setting.
 
 #### Static Credentials
 
@@ -179,36 +179,34 @@ When you pin a tool to a specific installed MCP server connection instead of usi
 
 - **Team-installed connection**: can only be assigned to a **team-scoped** Agent or MCP Gateway that includes that same team
 - **Personal connection**: can only be assigned to a resource the connection owner could access directly
-- **Dynamic / resolve at call time**: skips static-owner checks because Archestra resolves credentials per caller at execution time
+- **Resolve at call time**: skips static-owner checks because Archestra resolves credentials per caller at execution time
 
 This means a team-shared connection is governed by the team it is shared with, not by the individual who originally installed it. Personal connections still follow the connection owner's access boundary.
 
-#### Dynamic Credential Resolution
+#### Resolve at Call Time
 
-By default, each MCP server installation has a single credential that is shared by all callers.
+When a tool assignment uses "Resolve at call time" (or an agent has **All tools** dynamic access), Archestra picks the credential at execution time. Which one is used is defined on the MCP server itself — the **Agent connections** setting on the server's Connections page:
 
-When you enable "Resolve at call time" on a server, Archestra resolves the credential dynamically based on the caller's identity. This enables multi-tenant setups where each developer uses their own GitHub PAT or each team member uses their own Jira access token.
+- **On behalf of the user** (default): the chatting identity's own connection takes priority, falling back to a connection it can access. A user token resolves to that user's personal connection, then a connection for a team they belong to, then an org-scoped connection; a team token resolves to that team's connection, then an org-scoped one. A caller with no reachable connection gets an actionable connect prompt.
+- **Always use one account**: every runtime-resolved call goes through the chosen connection, regardless of the caller — a service account. Use this when the whole org or a team should share one upstream account. If that connection is revoked, the server returns to on-behalf-of-the-user resolution.
 
 ```mermaid
 flowchart TD
-    A["Tool call arrives<br/>with Gateway Token"] --> B{Dynamic credentials<br/>enabled?}
-    B -- No --> C["Use server's<br/>pre-configured credential"]
-    B -- Yes --> D{Caller has<br/>personal credential?}
-    D -- Yes --> E["Use caller's credential"]
-    D -- No --> F{Team member<br/>has credential?}
-    F -- Yes --> G["Use team member's<br/>credential"]
-    F -- No --> J["Return error +<br/>install link"]
+    A["Tool call arrives<br/>with Gateway Token"] --> B{Assignment resolves<br/>credentials at runtime?}
+    B -- No --> C["Use the assignment's<br/>pinned credential"]
+    B -- Yes --> P{Agent connections set to<br/>one shared account?}
+    P -- Yes --> S["Use that account<br/>(service account)"]
+    P -- No --> D{Caller has their<br/>own connection?}
+    D -- Yes --> E["Use the caller's<br/>own credential"]
+    D -- No --> F{Reachable team or<br/>org connection?}
+    F -- Yes --> G["Use that<br/>connection"]
+    F -- No --> J["Return error +<br/>connect link"]
 
+    style S fill:#d4edda,stroke:#28a745
     style E fill:#d4edda,stroke:#28a745
     style G fill:#d4edda,stroke:#28a745
     style J fill:#f8d7da,stroke:#dc3545
 ```
-
-When dynamic credentials are enabled, Archestra resolves them in priority order:
-
-1. The calling user's own personal credential (highest priority)
-2. A credential owned by a team member on the same team
-3. If no credential is found, an error is returned with an install link
 
 #### Missing Credentials
 

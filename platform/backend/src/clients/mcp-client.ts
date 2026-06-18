@@ -34,6 +34,7 @@ import config from "@/config";
 import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
 import logger from "@/logging";
 import {
+  AgentModel,
   InternalMcpCatalogModel,
   McpHttpSessionModel,
   McpServerModel,
@@ -49,6 +50,7 @@ import {
 } from "@/services/identity-providers/enterprise-managed/broker";
 import { findExternalIdentityProviderById } from "@/services/identity-providers/oidc";
 import type {
+  Tool as CatalogTool,
   CommonMcpToolDefinition,
   CommonToolCall,
   CommonToolResult,
@@ -344,6 +346,18 @@ class McpClient {
       conversationId?: string;
       identityProviderRedirectPath?: string;
       elicitationHandler?: McpElicitationHandler;
+      /**
+       * Pre-resolved catalog tool row for dynamic tool access: lets run_tool
+       * execute a tool the agent was never assigned. This governs tool ACCESS
+       * only. Whose credential/connection the call uses is still decided by
+       * the MCP server's connection policy (on-behalf-of the caller, or a
+       * pinned service account) — identical to an assigned tool. An
+       * unassigned tool has no assignment row, so it resolves its connection
+       * at call time (it can't carry a static pin). Access authorization
+       * happens at the dispatch layer (archestra-mcp-server/dynamic-tools.ts)
+       * before this is set; the gateway path never sets it.
+       */
+      availableTool?: CatalogTool;
     },
   ): Promise<CommonToolResult> {
     // Derive auth info for logging
@@ -356,7 +370,11 @@ class McpClient {
         : undefined;
 
     // Validate and get tool metadata
-    const validationResult = await this.validateAndGetTool(toolCall, owner);
+    const validationResult = await this.validateAndGetTool(
+      toolCall,
+      owner,
+      options?.availableTool,
+    );
     if ("error" in validationResult) {
       return validationResult.error;
     }
@@ -1164,6 +1182,7 @@ class McpClient {
   private async validateAndGetTool(
     toolCall: CommonToolCall,
     owner: ToolOwner,
+    availableTool?: CatalogTool,
   ): Promise<
     | {
         tool: McpToolAssignment;
@@ -1202,7 +1221,26 @@ class McpClient {
       }
     }
 
-    const tool = mcpTools[0];
+    let tool: McpToolAssignment | undefined = mcpTools[0];
+
+    // Dynamic tool access ("All tools" mode): the dispatcher pre-resolved a
+    // tool the agent has no assignment row for. Shape it like an assignment so
+    // downstream resolution is identical. It has no row to inherit a credential
+    // mode from and can't carry a static pin, so it resolves its connection at
+    // call time — which still defers to the MCP server's connection policy
+    // (on-behalf-of the caller, or a pinned service account). An assigned row
+    // keeps precedence here; in "All tools" mode the override below then routes
+    // even a leftover static assignment through the server's connection policy.
+    if (!tool && availableTool && availableTool.name === toolCall.name) {
+      tool = {
+        toolName: availableTool.name,
+        mcpServerId: null,
+        credentialResolutionMode: "dynamic",
+        catalogId: availableTool.catalogId,
+        catalogName: null,
+        meta: availableTool.meta ?? null,
+      };
+    }
 
     if (!tool) {
       const message = unavailableThirdPartyToolMessage(toolCall.name);
@@ -1220,6 +1258,33 @@ class McpClient {
             toolName: toolCall.name,
           },
         ),
+      };
+    }
+
+    // "All tools" mode overrides a leftover per-tool credential pin. When the
+    // agent has access_all_tools on, credentials follow the MCP server's
+    // connection policy (on-behalf-of the caller, or a pinned service account)
+    // for every tool — a static assignment left over from Custom mode must not
+    // dictate the credential. The assignment row stays in the DB so switching
+    // back to Custom restores it. Only static pins are rewritten; dynamic is
+    // already server-policy and enterprise-managed keeps its own mechanism.
+    if (
+      tool.credentialResolutionMode === "static" &&
+      owner.type === "agent" &&
+      (await AgentModel.getAccessAllTools(owner.id))
+    ) {
+      logger.info(
+        {
+          toolName: toolCall.name,
+          agentId: owner.id,
+          mcpServerId: tool.mcpServerId,
+        },
+        "All-tools mode: ignoring static assignment pin, resolving via the MCP server's connection policy",
+      );
+      tool = {
+        ...tool,
+        mcpServerId: null,
+        credentialResolutionMode: "dynamic",
       };
     }
 
@@ -1444,8 +1509,45 @@ class McpClient {
     // Get all servers for this catalog
     const allServers = await McpServerModel.findByCatalogId(tool.catalogId);
 
-    // User token: try user's personal server, then team-owned servers for
-    // teams the user belongs to, then fall back to an org-scoped install.
+    // The catalog item defines how agents connect to it. A pinned connection
+    // ("service account") routes every runtime-resolved call through that one
+    // installation, regardless of the caller. The pin is re-validated against
+    // the catalog's installs on every call (no DB-level FK — see the schema
+    // comment), so a revoked connection degrades to resolve-at-call-time.
+    if (catalogItem.dynamicConnectionMcpServerId) {
+      const pinnedServer = allServers.find(
+        (s) => s.id === catalogItem.dynamicConnectionMcpServerId,
+      );
+      if (pinnedServer) {
+        logger.info(
+          {
+            toolName: toolCall.name,
+            catalogId: tool.catalogId,
+            serverId: pinnedServer.id,
+          },
+          `Connection resolution: using the catalog's pinned service-account connection for tool ${toolCall.name}`,
+        );
+        return {
+          targetMcpServerId: pinnedServer.id,
+          mcpServerName: pinnedServer.name,
+        };
+      }
+      logger.warn(
+        {
+          toolName: toolCall.name,
+          catalogId: tool.catalogId,
+          dynamicConnectionMcpServerId:
+            catalogItem.dynamicConnectionMcpServerId,
+        },
+        "Connection resolution: the catalog's pinned connection no longer exists; resolving at call time",
+      );
+    }
+
+    // Resolve at call time (no pinned connection). The chatting identity's own
+    // connection takes priority, then falls back to a connection it can access:
+    // user token -> personal, then a team the user belongs to, then org-scoped;
+    // team token -> the team's connection, then org-scoped. Pinning a service
+    // account (above) overrides this to force one connection for every caller.
     if (tokenAuth.userId) {
       // Priority 1: Personal credential owned by current user
       const userServer = allServers.find(
