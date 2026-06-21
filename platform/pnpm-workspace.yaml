@@ -31,11 +31,9 @@ overrides:
   # botframework-streaming pins ws 8.20.1, which the range selector above doesn't
   # catch; force that edge to the CVE-2026-48779 fix too.
   botframework-streaming>ws: '>=8.21.0'
-  # form-data 3.0.5 / 4.0.6 (fix CVE-2026-12143, HIGH) were published 2026-06-12,
-  # inside the 7-day window — excluded from minimumReleaseAge below and pinned
-  # exact so a `>=` floor can't pull an unvetted release.
-  form-data@>=4: 4.0.6
-  form-data@<4: 3.0.5
+  # form-data 3.0.5 / 4.0.6 are the CVE-2026-12143 (HIGH) fix floors.
+  form-data@>=4: '>=4.0.6'
+  form-data@<4: '>=3.0.5'
   '@hono/node-server': 1.19.14
   body-parser: 2.2.1
   dompurify: 3.4.0
@@ -108,10 +106,6 @@ minimumReleaseAge: 10080
 minimumReleaseAgeExclude:
   - next
   - "@next/*"
-  # TEMPORARY: form-data 3.0.5 / 4.0.6 (fix CVE-2026-12143, HIGH) were published
-  # 2026-06-12 and clear the 7-day window on 2026-06-19. Remove on/after that date
-  # — the lockfile stays pinned at the fixed versions regardless.
-  - form-data
   # TEMPORARY: undici 7.28.0 (fix CVE-2026-9697, HIGH) was published 2026-06-15
   # and clears the 7-day window on 2026-06-22. Remove on/after that date — the
   # lockfile stays pinned at 7.28.0 regardless.
