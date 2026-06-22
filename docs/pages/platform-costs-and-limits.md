@@ -2,7 +2,7 @@
 title: Costs & Limits
 category: LLM Proxy
 order: 4
-lastUpdated: 2026-06-09
+lastUpdated: 2026-06-22
 ---
 
 Archestra tracks LLM usage costs, enforces usage limits, and records savings from model optimization and tool-result compression. These controls work together: pricing defines cost, logs and statistics show what happened, limits stop or shape usage, and optimization reduces spend before a request reaches a model.
@@ -64,15 +64,15 @@ If you use custom or self-hosted models, add pricing explicitly so cost reportin
 
 ## Optimization Rules
 
-Optimization rules reduce cost before a request is sent to an LLM. They evaluate request context and can switch the request to a lower-cost model when the rule conditions match.
+Optimization rules reduce cost before a request is sent to an LLM. They evaluate request context and can switch the request to a lower-cost model when the rule conditions match. Rules can target the organization, a team, or a specific agent.
 
 Typical uses:
 
 - route short prompts to a cheaper model
 - use a less expensive model when tool use is not required
-- apply time-based policies for predictable traffic patterns
+- make a specific agent or team use a cheaper fallback model
 
-Rules are applied by priority order. This makes them useful for layered policies, where a specific exception should win over a general fallback.
+Rules are applied by specificity first: agent rules, then team rules, then organization rules. Within the same scope, older rules are evaluated first.
 
 ## TOON Compression
 

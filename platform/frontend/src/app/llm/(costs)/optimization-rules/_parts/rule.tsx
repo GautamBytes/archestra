@@ -17,6 +17,7 @@ import { WithPermissions } from "@/components/roles/with-permissions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import {
   Select,
   SelectContent,
@@ -31,15 +32,25 @@ import { cn } from "@/lib/utils";
 
 type EntityType = OptimizationRule["entityType"];
 type Conditions = OptimizationRule["conditions"];
+type RuleAgent = {
+  id: string;
+  name: string;
+  description?: string | null;
+};
 
 // Helper to get entity display name
 function getEntityName(
   entityType: EntityType,
   entityId: string,
   teams: Team[],
+  agents: RuleAgent[],
 ): string {
   if (entityType === "organization") {
     return "whole organization";
+  }
+  if (entityType === "agent") {
+    const agent = agents.find((candidate) => candidate.id === entityId);
+    return agent?.name || "unknown agent";
   }
   const team = teams.find((t) => t.id === entityId);
   return team?.name || "unknown team";
@@ -86,17 +97,19 @@ function EntitySelect({
   entityType,
   entityId,
   teams,
+  agents,
   onChange,
   editable,
 }: {
   entityType: EntityType;
   entityId: string;
   teams: Team[];
+  agents: RuleAgent[];
   onChange: (entityType: EntityType, entityId?: string) => void;
   editable?: boolean;
 }) {
   if (!editable) {
-    const entityName = getEntityName(entityType, entityId, teams);
+    const entityName = getEntityName(entityType, entityId, teams, agents);
     return (
       <Badge variant="outline" className="text-sm">
         {entityName}
@@ -109,7 +122,11 @@ function EntitySelect({
       <Select
         value={entityType}
         onValueChange={(value) => {
-          if (value === "organization" || value === "team") {
+          if (
+            value === "organization" ||
+            value === "team" ||
+            value === "agent"
+          ) {
             onChange(value, undefined);
           }
         }}
@@ -120,6 +137,7 @@ function EntitySelect({
         <SelectContent>
           <SelectItem value="organization">Organization</SelectItem>
           <SelectItem value="team">Team</SelectItem>
+          <SelectItem value="agent">Agent</SelectItem>
         </SelectContent>
       </Select>
       {entityType === "team" && (
@@ -139,6 +157,21 @@ function EntitySelect({
           </SelectContent>
         </Select>
       )}
+      {entityType === "agent" && (
+        <SearchableSelect
+          value={entityId}
+          onValueChange={(value) => onChange(entityType, value)}
+          placeholder="Select agent"
+          searchPlaceholder="Search agents"
+          emptyMessage="No agents found."
+          items={agents.map((agent) => ({
+            value: agent.id,
+            label: agent.name,
+            description: agent.description ?? undefined,
+          }))}
+          className="w-full sm:flex-1"
+        />
+      )}
     </div>
   );
 }
@@ -146,6 +179,7 @@ function EntitySelect({
 type RuleProps = Omit<OptimizationRule, "createdAt" | "updatedAt"> & {
   tokenPrices: ModelPricing;
   teams?: Team[];
+  agents?: RuleAgent[];
   editable?: boolean;
   onChange?: (
     data: Omit<OptimizationRule, "id" | "createdAt" | "updatedAt">,
@@ -166,6 +200,7 @@ type OptimizationRuleFormProps = Pick<
 > & {
   tokenPrices: ModelPricing;
   teams?: Team[];
+  agents?: RuleAgent[];
   onChange?: (
     data: Omit<OptimizationRule, "id" | "createdAt" | "updatedAt">,
   ) => void;
@@ -181,6 +216,7 @@ export function OptimizationRuleForm({
   targetModel,
   tokenPrices,
   teams = [],
+  agents = [],
   onChange,
   onToggle,
 }: OptimizationRuleFormProps) {
@@ -249,6 +285,7 @@ export function OptimizationRuleForm({
             entityType={formData.entityType}
             entityId={formData.entityId}
             teams={teams}
+            agents={agents}
             onChange={(nextEntityType, nextEntityId) =>
               updateFormData({
                 entityType: nextEntityType,
@@ -336,6 +373,7 @@ export function Rule({
   targetModel,
   tokenPrices,
   teams = [],
+  agents = [],
   editable,
   onChange,
   onToggle,
@@ -445,6 +483,7 @@ export function Rule({
         entityType={formData.entityType}
         entityId={formData.entityId}
         teams={teams}
+        agents={agents}
         onChange={onEntityChange}
         editable={editable}
       />

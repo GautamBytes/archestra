@@ -1,4 +1,4 @@
-import { ModelModel } from "@/models";
+import { ModelModel, OptimizationRuleModel } from "@/models";
 import { describe, expect, test } from "@/test";
 import { TiktokenTokenizer } from "@/tokenizers";
 import type { CommonMcpToolDefinition } from "@/types";
@@ -6,6 +6,7 @@ import {
   calculateCacheCost,
   calculateCost,
   estimateToolTokens,
+  getOptimizedModel,
 } from "./cost-optimization";
 
 describe("calculateCost", () => {
@@ -332,5 +333,105 @@ describe("estimateToolTokens", () => {
 
     const tokens = estimateToolTokens(tools, tokenizer);
     expect(tokens).toBeGreaterThan(0);
+  });
+});
+
+describe("getOptimizedModel", () => {
+  const messages = [{ role: "user" as const, content: "Short prompt" }];
+
+  test("applies a team-scoped optimization rule to an agent in that team", async ({
+    makeAgent,
+    makeOrganization,
+    makeTeam,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const team = await makeTeam(org.id, user.id);
+    const agent = await makeAgent({
+      organizationId: org.id,
+      scope: "team",
+      teams: [team.id],
+    });
+
+    await OptimizationRuleModel.create({
+      entityType: "team",
+      entityId: team.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "team-model",
+      enabled: true,
+    });
+
+    await expect(
+      getOptimizedModel(agent, messages, "openai", false),
+    ).resolves.toBe("team-model");
+  });
+
+  test("uses agent rules before broader matching rules", async ({
+    makeAgent,
+    makeOrganization,
+    makeTeam,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const user = await makeUser();
+    const team = await makeTeam(org.id, user.id);
+    const agent = await makeAgent({
+      organizationId: org.id,
+      scope: "team",
+      teams: [team.id],
+    });
+
+    await OptimizationRuleModel.create({
+      entityType: "organization",
+      entityId: org.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "org-model",
+      enabled: true,
+    });
+    await OptimizationRuleModel.create({
+      entityType: "team",
+      entityId: team.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "team-model",
+      enabled: true,
+    });
+    await OptimizationRuleModel.create({
+      entityType: "agent",
+      entityId: agent.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "agent-model",
+      enabled: true,
+    });
+
+    await expect(
+      getOptimizedModel(agent, messages, "openai", false),
+    ).resolves.toBe("agent-model");
+  });
+
+  test("does not apply another organization's rule to a teamless agent", async ({
+    makeAgent,
+    makeOrganization,
+  }) => {
+    const otherOrg = await makeOrganization();
+    const agentOrg = await makeOrganization();
+    const agent = await makeAgent({ organizationId: agentOrg.id, teams: [] });
+
+    await OptimizationRuleModel.create({
+      entityType: "organization",
+      entityId: otherOrg.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "other-org-model",
+      enabled: true,
+    });
+
+    await expect(
+      getOptimizedModel(agent, messages, "openai", false),
+    ).resolves.toBeNull();
   });
 });

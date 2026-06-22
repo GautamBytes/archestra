@@ -1,5 +1,5 @@
 import type { SupportedProvider } from "@archestra/shared";
-import { and, asc, eq, getTableColumns, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, or, sql } from "drizzle-orm";
 import db, { schema } from "@/database";
 import { notDeleted } from "@/database/schemas/soft-deletable-table";
 import logger from "@/logging";
@@ -180,56 +180,75 @@ class OptimizationRuleModel {
   }
 
   /**
-   * Find enabled rules for an organization and provider
+   * Find enabled optimization rules that apply to one agent at runtime.
    */
-  static async findEnabledByOrganizationAndProvider(
-    organizationId: string,
-    provider: SupportedProvider,
-  ): Promise<OptimizationRule[]> {
+  static async findEnabledApplicableToAgent(params: {
+    organizationId: string;
+    agentId: string;
+    teamIds: string[];
+    provider: SupportedProvider;
+  }): Promise<OptimizationRule[]> {
+    const { organizationId, agentId, teamIds, provider } = params;
     logger.debug(
-      { organizationId, provider },
-      "OptimizationRuleModel.findEnabledByOrganizationAndProvider: fetching rules",
+      { organizationId, agentId, teamIds, provider },
+      "OptimizationRuleModel.findEnabledApplicableToAgent: fetching rules",
     );
+
+    const applicableScopes = [
+      and(
+        eq(schema.optimizationRulesTable.entityType, "agent"),
+        eq(schema.optimizationRulesTable.entityId, agentId),
+        sql`EXISTS (
+          SELECT 1 FROM ${schema.agentsTable}
+          WHERE ${schema.agentsTable.id}::text = ${schema.optimizationRulesTable.entityId}
+            AND ${schema.agentsTable.organizationId} = ${organizationId}
+            AND ${schema.agentsTable.deletedAt} IS NULL
+        )`,
+      ),
+      and(
+        eq(schema.optimizationRulesTable.entityType, "organization"),
+        eq(schema.optimizationRulesTable.entityId, organizationId),
+      ),
+    ];
+
+    if (teamIds.length > 0) {
+      applicableScopes.push(
+        and(
+          eq(schema.optimizationRulesTable.entityType, "team"),
+          inArray(schema.optimizationRulesTable.entityId, teamIds),
+          sql`EXISTS (
+            SELECT 1 FROM ${schema.teamsTable}
+            WHERE ${schema.teamsTable.id} = ${schema.optimizationRulesTable.entityId}
+              AND ${schema.teamsTable.organizationId} = ${organizationId}
+          )`,
+        ),
+      );
+    }
+
     const rules = await db
       .select()
       .from(schema.optimizationRulesTable)
       .where(
         and(
-          eq(schema.optimizationRulesTable.entityType, "organization"),
-          eq(schema.optimizationRulesTable.entityId, organizationId),
           eq(schema.optimizationRulesTable.provider, provider),
           eq(schema.optimizationRulesTable.enabled, true),
+          or(...applicableScopes),
         ),
       )
-      .orderBy(asc(schema.optimizationRulesTable.createdAt));
+      .orderBy(
+        sql<number>`CASE
+          WHEN ${schema.optimizationRulesTable.entityType} = 'agent' THEN 0
+          WHEN ${schema.optimizationRulesTable.entityType} = 'team' THEN 1
+          ELSE 2
+        END`,
+        asc(schema.optimizationRulesTable.createdAt),
+      );
 
     logger.debug(
-      { organizationId, provider, count: rules.length },
-      "OptimizationRuleModel.findEnabledByOrganizationAndProvider: completed",
+      { organizationId, agentId, provider, count: rules.length },
+      "OptimizationRuleModel.findEnabledApplicableToAgent: completed",
     );
     return rules;
-  }
-
-  /**
-   * Get the first organization ID that has optimization rules
-   * Used as fallback when an agent has no teams
-   */
-  static async getFirstOrganizationId(): Promise<string | null> {
-    logger.debug(
-      "OptimizationRuleModel.getFirstOrganizationId: fetching first organization with rules",
-    );
-    const [result] = await db
-      .select({ entityId: schema.optimizationRulesTable.entityId })
-      .from(schema.optimizationRulesTable)
-      .where(sql`${schema.optimizationRulesTable.entityType} = 'organization'`)
-      .limit(1);
-
-    const organizationId = result?.entityId || null;
-    logger.debug(
-      { organizationId },
-      "OptimizationRuleModel.getFirstOrganizationId: completed",
-    );
-    return organizationId;
   }
 
   /**

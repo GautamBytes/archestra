@@ -1,11 +1,6 @@
 import type { SupportedProvider } from "@archestra/shared";
 import logger from "@/logging";
-import {
-  AgentTeamModel,
-  ModelModel,
-  OptimizationRuleModel,
-  TeamModel,
-} from "@/models";
+import { AgentTeamModel, ModelModel, OptimizationRuleModel } from "@/models";
 import {
   getTokenizer,
   type ProviderMessage,
@@ -87,48 +82,16 @@ export async function getOptimizedModel<
   tools: CommonMcpToolDefinition[] = [],
 ): Promise<string | null> {
   const agentId = agent.id;
-
-  // Get organizationId the same way limits do: from agent's teams OR fallback
-  let organizationId: string | null = null;
+  const organizationId = agent.organizationId;
   const agentTeamIds = await AgentTeamModel.getTeamsForAgent(agentId);
 
-  if (agentTeamIds.length > 0) {
-    // Get organizationId from agent's first team
-    const teams = await TeamModel.findByIds(agentTeamIds);
-    if (teams.length > 0 && teams[0].organizationId) {
-      organizationId = teams[0].organizationId;
-      logger.info(
-        { agentId, organizationId },
-        "[CostOptimization] resolved organizationId from team",
-      );
-    }
-  } else {
-    // If agent has no teams, check if there are any organization optimization rules to apply (fallback)
-    // TODO: this fallback doesn't work if there are multiple organizations.
-    organizationId = await OptimizationRuleModel.getFirstOrganizationId();
-
-    if (organizationId) {
-      logger.info(
-        { agentId, organizationId },
-        "[CostOptimization] agent has no teams - using fallback organization",
-      );
-    }
-  }
-
-  if (!organizationId) {
-    logger.warn(
-      { agentId },
-      "[CostOptimization] could not resolve organizationId",
-    );
-    return null;
-  }
-
   // Fetch enabled optimization rules for this organization, agent, and provider
-  const rules =
-    await OptimizationRuleModel.findEnabledByOrganizationAndProvider(
-      organizationId,
-      provider,
-    );
+  const rules = await OptimizationRuleModel.findEnabledApplicableToAgent({
+    organizationId,
+    agentId,
+    teamIds: agentTeamIds,
+    provider,
+  });
 
   if (rules.length === 0) {
     logger.info(

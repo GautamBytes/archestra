@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "@/test";
-import type { InsertOptimizationRule, OptimizationRule } from "@/types";
+import type { OptimizationRule } from "@/types";
 import AgentModel from "./agent";
 import OptimizationRuleModel from "./optimization-rule";
 
@@ -151,35 +151,146 @@ describe("OptimizationRuleModel.matchByRules", () => {
   });
 });
 
-describe("OptimizationRuleModel.getFirstOrganizationId", () => {
-  test("returns organization ID when rules exist", async ({
+describe("OptimizationRuleModel.findEnabledApplicableToAgent", () => {
+  test("returns only enabled provider rules applicable to the agent, ordered by specificity", async ({
+    makeAgent,
     makeOrganization,
+    makeTeam,
+    makeUser,
   }) => {
     const org = await makeOrganization();
+    const otherOrg = await makeOrganization();
+    const user = await makeUser();
+    const team = await makeTeam(org.id, user.id);
+    const otherTeam = await makeTeam(org.id, user.id);
+    const agent = await makeAgent({
+      organizationId: org.id,
+      scope: "team",
+      teams: [team.id],
+    });
+    const otherAgent = await makeAgent({ organizationId: org.id });
 
-    // Create an organization-level optimization rule
-    const ruleData: InsertOptimizationRule = {
+    const organizationRule = await OptimizationRuleModel.create({
       entityType: "organization",
       entityId: org.id,
       conditions: [{ maxLength: 1000 }],
       provider: "openai",
-      targetModel: "gpt-4o-mini",
+      targetModel: "org-model",
       enabled: true,
-    };
-    await OptimizationRuleModel.create(ruleData);
+    });
+    const teamRule = await OptimizationRuleModel.create({
+      entityType: "team",
+      entityId: team.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "team-model",
+      enabled: true,
+    });
+    const agentRule = await OptimizationRuleModel.create({
+      entityType: "agent",
+      entityId: agent.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "agent-model",
+      enabled: true,
+    });
 
-    const result = await OptimizationRuleModel.getFirstOrganizationId();
+    await OptimizationRuleModel.create({
+      entityType: "team",
+      entityId: otherTeam.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "other-team-model",
+      enabled: true,
+    });
+    await OptimizationRuleModel.create({
+      entityType: "agent",
+      entityId: otherAgent.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "other-agent-model",
+      enabled: true,
+    });
+    await OptimizationRuleModel.create({
+      entityType: "organization",
+      entityId: otherOrg.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "other-org-model",
+      enabled: true,
+    });
+    await OptimizationRuleModel.create({
+      entityType: "organization",
+      entityId: org.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "anthropic",
+      targetModel: "wrong-provider-model",
+      enabled: true,
+    });
+    await OptimizationRuleModel.create({
+      entityType: "organization",
+      entityId: org.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "disabled-model",
+      enabled: false,
+    });
 
-    expect(result).toBe(org.id);
+    const rules = await OptimizationRuleModel.findEnabledApplicableToAgent({
+      organizationId: org.id,
+      agentId: agent.id,
+      teamIds: [team.id],
+      provider: "openai",
+    });
+
+    expect(rules.map((rule) => rule.id)).toEqual([
+      agentRule.id,
+      teamRule.id,
+      organizationRule.id,
+    ]);
   });
 
-  test("returns null when no organization rules exist", async () => {
-    // Since we're in a test with a fresh database, there should be no rules
-    // Note: This test might be flaky if other tests create rules and don't clean up
-    const result = await OptimizationRuleModel.getFirstOrganizationId();
+  test("ignores team rules for cross-organization agent-team assignments", async ({
+    makeAgent,
+    makeOrganization,
+    makeTeam,
+    makeUser,
+  }) => {
+    const agentOrg = await makeOrganization();
+    const foreignOrg = await makeOrganization();
+    const user = await makeUser();
+    const foreignTeam = await makeTeam(foreignOrg.id, user.id);
+    const agent = await makeAgent({
+      organizationId: agentOrg.id,
+      scope: "team",
+      teams: [foreignTeam.id],
+    });
+    const organizationRule = await OptimizationRuleModel.create({
+      entityType: "organization",
+      entityId: agentOrg.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "agent-org-model",
+      enabled: true,
+    });
 
-    // Result could be null or an org ID depending on test isolation
-    expect(result === null || typeof result === "string").toBe(true);
+    await OptimizationRuleModel.create({
+      entityType: "team",
+      entityId: foreignTeam.id,
+      conditions: [{ maxLength: 1000 }],
+      provider: "openai",
+      targetModel: "foreign-team-model",
+      enabled: true,
+    });
+
+    const rules = await OptimizationRuleModel.findEnabledApplicableToAgent({
+      organizationId: agentOrg.id,
+      agentId: agent.id,
+      teamIds: [foreignTeam.id],
+      provider: "openai",
+    });
+
+    expect(rules.map((rule) => rule.id)).toEqual([organizationRule.id]);
   });
 });
 

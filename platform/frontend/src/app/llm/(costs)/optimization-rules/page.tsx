@@ -28,6 +28,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useProfiles } from "@/lib/agent.query";
 import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
 import { useModelsWithApiKeys } from "@/lib/llm-models.query";
 import type { OptimizationRule } from "@/lib/optimization-rule.query";
@@ -81,6 +82,9 @@ export default function OptimizationRulesPage() {
   const { data: rules = [], isPending } = useOptimizationRules();
   const { data: modelsWithApiKeys = [] } = useModelsWithApiKeys();
   const { data: teams = [] } = useTeams();
+  const { data: agents = [] } = useProfiles({
+    filters: { agentTypes: ["agent"] },
+  });
   const { data: organization } = useOrganization();
   const createRule = useCreateOptimizationRule();
   const updateRule = useUpdateOptimizationRule();
@@ -157,6 +161,12 @@ export default function OptimizationRulesPage() {
         cell: ({ row }) => {
           if (row.original.entityType === "organization") {
             return "Organization";
+          }
+          if (row.original.entityType === "agent") {
+            const agent = agents.find(
+              (candidate) => candidate.id === row.original.entityId,
+            );
+            return agent?.name ?? "Unknown agent";
           }
           const team = teams.find(
             (candidate) => candidate.id === row.original.entityId,
@@ -242,11 +252,14 @@ export default function OptimizationRulesPage() {
         ),
       },
     ],
-    [teams, updateRule],
+    [agents, teams, updateRule],
   );
 
   async function handleSubmit() {
     if (draft.entityType === "organization" && !organization?.id) {
+      return;
+    }
+    if (draft.entityType !== "organization" && !draft.entityId) {
       return;
     }
 
@@ -316,6 +329,7 @@ export default function OptimizationRulesPage() {
             <SelectItem value="all">All applied to</SelectItem>
             <SelectItem value="organization">Organization</SelectItem>
             <SelectItem value="team">Team</SelectItem>
+            <SelectItem value="agent">Agent</SelectItem>
           </SelectContent>
         </Select>
 
@@ -392,6 +406,7 @@ export default function OptimizationRulesPage() {
               {...draft}
               tokenPrices={tokenPrices}
               teams={teams}
+              agents={agents}
               onChange={setDraft}
               onToggle={(enabled) =>
                 setDraft((current) => ({ ...current, enabled }))
@@ -410,6 +425,7 @@ export default function OptimizationRulesPage() {
               type="submit"
               disabled={
                 !draft.targetModel ||
+                (draft.entityType !== "organization" && !draft.entityId) ||
                 createRule.isPending ||
                 updateRule.isPending
               }
